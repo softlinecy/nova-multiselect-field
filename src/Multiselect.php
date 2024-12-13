@@ -1,30 +1,36 @@
 <?php
 
-namespace OptimistDigital\MultiselectField;
+namespace Outl1ne\MultiselectField;
 
+use Closure;
 use Exception;
-use RuntimeException;
 use Laravel\Nova\Fields\Field;
+use Illuminate\Support\Collection;
+use Laravel\Nova\Contracts\RelatableField;
 use Laravel\Nova\Http\Requests\NovaRequest;
+use Laravel\Nova\Fields\SupportsDependentFields;
+use Outl1ne\MultiselectField\Traits\MultiselectBelongsToSupport;
 
-class Multiselect extends Field
+class Multiselect extends Field implements RelatableField
 {
+    use MultiselectBelongsToSupport, SupportsDependentFields;
+
     public $component = 'multiselect-field';
 
     protected $pageResponseResolveCallback;
     protected $saveAsJSON = false;
-    protected $resourceClass = null;
+    protected $keyName = null;
 
     /**
      * Sets the options available for select.
      *
      * @param  array|callable
-     * @return \OptimistDigital\MultiselectField\Multiselect
+     * @return \Outl1ne\MultiselectField\Multiselect
      **/
     public function options($options = [])
     {
         if (is_callable($options)) $options = call_user_func($options);
-        $options = collect($options ?? []);
+        $options = collect($options ?: []);
 
         $isOptionGroup = $options->contains(function ($label, $value) {
             return is_array($label);
@@ -53,18 +59,26 @@ class Multiselect extends Field
         ]);
     }
 
-    public function api($path, $resourceClass)
+    public function api($path, $resourceClass, $keyName = null)
     {
+        if (empty($resourceClass)) throw new Exception('Multiselect requires resourceClass, none provided.');
+        if (empty($path)) throw new Exception('Multiselect requires apiUrl, none provided.');
+
+        $this->resourceKeyName($keyName);
         $this->resourceClass = $resourceClass;
 
-        $this->resolveUsing(function ($value) {
-            $value = array_values((array)$value);
+        $this->resolveUsing(function ($value) use ($resourceClass) {
+            $request = app()->make(NovaRequest::class);
+            $model = $resourceClass::newModel();
 
-            if (empty($this->resourceClass) && empty($this->apiUrl)) return $value;
+            $this->options([]);
+            $value = array_values($value instanceof Collection ? $value->toArray() : (array)$value);
 
             if (empty($value)) {
-                $this->options([]);
-                return $value;
+                $defaultValue = $this->resolveDefaultValue($request);
+                if (!$defaultValue || $defaultValue->isEmpty()) return $value;
+
+                $value = $defaultValue->pluck($this->keyName ?? $model->getKeyName())->unique()->filter()->values();
             }
 
             // Handle translatable/collection where values are an array of arrays
@@ -73,15 +87,10 @@ class Multiselect extends Field
             }
 
             try {
-                $options = [];
-                $modelObj = (new $this->resourceClass::$model);
-                $models = $this->resourceClass::$model::whereIn($modelObj->getKeyName(), $value)->get();
-                $models->each(function ($model) use (&$options) {
-                    $options[$model[$model->getKeyName()]] = $model[$this->resourceClass::$title];
-                });
-                $this->options($options);
+                $models = $model::whereIn($this->keyName ?? $model->getKeyName(), $value)->get();
+
+                $this->setOptionsFromModels($models, $resourceClass);
             } catch (Exception $e) {
-                $this->options([]);
             }
 
             return $value;
@@ -90,39 +99,103 @@ class Multiselect extends Field
         return $this->withMeta(['apiUrl' => $path, 'labelKey' => $resourceClass::$title]);
     }
 
-    public function asyncResource($resourceClass)
+    public function asyncResource($resourceClass, $keyName = null)
     {
-        $this->resourceClass = $resourceClass;
         $apiUrl = "/nova-api/{$resourceClass::uriKey()}";
-        return $this->api($apiUrl, $resourceClass);
+        return $this->api($apiUrl, $resourceClass, $keyName);
     }
 
     protected function resolveAttribute($resource, $attribute)
     {
         $singleSelect = $this->meta['singleSelect'] ?? false;
         $value = data_get($resource, str_replace('->', '.', $attribute));
+        $saveAsJson = $this->shouldSaveAsJson($resource, $attribute);
 
-        if ($this->saveAsJSON || $singleSelect) return $value;
+        if ($value instanceof Collection) return $value;
+        if ($saveAsJson || $singleSelect) return $value;
         return is_array($value) || is_object($value) ? (array) $value : json_decode($value);
     }
 
     protected function fillAttributeFromRequest(NovaRequest $request, $requestAttribute, $model, $attribute)
     {
         $singleSelect = $this->meta['singleSelect'] ?? false;
-        $value = $request->input($requestAttribute) ?? null;
+        $value = $request->input($requestAttribute) ?: null;
+        $saveAsJson = $this->shouldSaveAsJson($model, $attribute);
 
         if ($singleSelect) {
             $model->{$attribute} = $value;
         } else {
-            $model->{$attribute} = $this->saveAsJSON || is_null($value) ? $value : json_encode($value);
+            $value = is_null($value) ? ($this->nullable ? $value : $value = []) : $value;
+            $model->{$attribute} = ($saveAsJson || is_null($value)) ? $value : json_encode($value);
         }
+    }
+
+    private function shouldSaveAsJson($model, $attribute)
+    {
+        if (!empty($model) && !is_array($model) && method_exists($model, 'getCasts')) {
+            $casts = $model->getCasts();
+            $isCastedToArray = ($casts[$attribute] ?? null) === 'array';
+            return $this->saveAsJSON || $isCastedToArray;
+        }
+        return false;
+    }
+
+    public function resolveForAction($request)
+    {
+        if (!is_null($this->value)) {
+            return;
+        }
+
+        if ($defaultValue = $this->resolveDefaultValue($request)) {
+            if ($this->resourceClass) {
+                $this->setOptionsFromModels($defaultValue, $this->resourceClass);
+                $this->value = $defaultValue->pluck($this->keyName ?? $this->resourceClass::newModel()->getKeyName());
+            } else {
+                $this->value = $defaultValue;
+            }
+        }
+    }
+
+    public function resolveDefaultValue(NovaRequest $request)
+    {
+        if (!$this->resourceClass || !is_null($this->value)) return parent::resolveDefaultValue($request);
+
+        if ($request->isCreateOrAttachRequest() || $request->isActionRequest()) {
+            if ($this->defaultCallback instanceof Closure) {
+                $defaultValue = call_user_func($this->defaultCallback, $request);
+            } else {
+                $defaultValue = $this->defaultCallback;
+            }
+
+            if (is_null($defaultValue)) return null;
+
+            $defaultValue = is_countable($defaultValue) ? collect($defaultValue) : collect([$defaultValue]);
+            $defaultValue = $defaultValue->filter(function ($val) {
+                if (empty($val)) return false;
+                if (is_object($val) && $class = get_class($val)) {
+                    if ($class === 'Laravel\Nova\Support\UndefinedValue') return false;
+                }
+                return true;
+            });
+
+
+            $model = $this->resourceClass::newModel();
+            $defaultValue->each(function ($defaultValueItem) use ($model) {
+                if (!$defaultValueItem instanceof $model) throw new Exception('Invalid default value. Value should be a single model or an array/collection of models.');
+            });
+            if ($defaultValue->isEmpty()) return null;
+
+            return $defaultValue;
+        }
+
+        return parent::resolveDefaultValue($request);
     }
 
     /**
      * Allows the field to save an actual JSON array to a SQL JSON column.
      *
      * @param bool $saveAsJSON
-     * @return \OptimistDigital\MultiselectField\Multiselect
+     * @return \Outl1ne\MultiselectField\Multiselect
      **/
     public function saveAsJSON($saveAsJSON = true)
     {
@@ -134,7 +207,7 @@ class Multiselect extends Field
      * Sets the max number of options the user can select.
      *
      * @param int $max
-     * @return \OptimistDigital\MultiselectField\Multiselect
+     * @return \Outl1ne\MultiselectField\Multiselect
      **/
     public function max($max)
     {
@@ -145,7 +218,7 @@ class Multiselect extends Field
      * Sets the placeholder value displayed on the field.
      *
      * @param string $placeholder
-     * @return \OptimistDigital\MultiselectField\Multiselect
+     * @return \Outl1ne\MultiselectField\Multiselect
      **/
     public function placeholder($placeholder)
     {
@@ -156,7 +229,7 @@ class Multiselect extends Field
      * Sets the maximum number of options displayed at once.
      *
      * @param int $optionsLimit
-     * @return \OptimistDigital\MultiselectField\Multiselect
+     * @return \Outl1ne\MultiselectField\Multiselect
      **/
     public function optionsLimit($optionsLimit)
     {
@@ -167,11 +240,23 @@ class Multiselect extends Field
      * Enables or disables reordering of the field values.
      *
      * @param bool $reorderable
-     * @return \OptimistDigital\MultiselectField\Multiselect
+     * @return \Outl1ne\MultiselectField\Multiselect
      **/
     public function reorderable($reorderable = true)
     {
         return $this->withMeta(['reorderable' => $reorderable]);
+    }
+
+    /**
+     * Set custom key name for model.
+     *
+     * @param string|null $keyName
+     * @return \Outl1ne\MultiselectField\Multiselect
+     **/
+    public function resourceKeyName($keyName = null)
+    {
+        $this->keyName = $keyName;
+        return $this;
     }
 
     /**
@@ -180,11 +265,16 @@ class Multiselect extends Field
      * This forces the value saved to be a single value and not an array.
      *
      * @param bool $singleSelect
-     * @return \OptimistDigital\MultiselectField\Multiselect
+     * @return \Outl1ne\MultiselectField\Multiselect
      **/
     public function singleSelect($singleSelect = true)
     {
         return $this->withMeta(['singleSelect' => $singleSelect]);
+    }
+
+    public function taggable($taggable = true)
+    {
+        return $this->withMeta(['taggable' => $taggable]);
     }
 
     /**
@@ -192,7 +282,7 @@ class Multiselect extends Field
      * user to select the whole group at once.
      *
      * @param bool $groupSelect
-     * @return \OptimistDigital\MultiselectField\Multiselect
+     * @return \Outl1ne\MultiselectField\Multiselect
      **/
     public function groupSelect($groupSelect = true)
     {
@@ -203,33 +293,63 @@ class Multiselect extends Field
      * Enable other-field dependency.
      *
      * @param string $otherFieldName
-     * @return \OptimistDigital\MultiselectField\Multiselect
+     * @return \Outl1ne\MultiselectField\Multiselect
      **/
-    public function dependsOn($otherFieldName)
+    public function optionsDependOn($otherFieldName, $options)
     {
-        return $this->withMeta(['dependsOn' => $otherFieldName]);
+        return $this->withMeta([
+            'optionsDependOn' => $otherFieldName,
+            'optionsDependOnOptions' => $options,
+        ]);
     }
 
     /**
-     * Set dependency options map as a keyed array of options.
+     * Enable other-field dependency that is not inside the same Flexible content.
      *
-     * @param array $options
-     * @return \OptimistDigital\MultiselectField\Multiselect
+     * @param string $otherFieldName
+     * @return \Outl1ne\MultiselectField\Multiselect
      **/
-    public function dependsOnOptions(array $options)
+    public function optionsDependOnOutsideFlexible($otherFieldName, $options)
     {
-        return $this->withMeta(['dependsOnOptions' => $options]);
+        return $this->withMeta([
+            'optionsDependOn' => $otherFieldName,
+            'optionsDependOnOptions' => $options,
+            'optionsDependOnOutsideFlexible' => true,
+        ]);
     }
 
     /**
      * Set max selectable value count as a keyed array of numbers.
      *
      * @param array $maxOptions
-     * @return \OptimistDigital\MultiselectField\Multiselect
+     * @return \Outl1ne\MultiselectField\Multiselect
      **/
-    public function dependsOnMax(array $maxOptions)
+    public function optionsDependOnMax(array $maxOptions)
     {
-        return $this->withMeta(['dependsOnMax' => $maxOptions]);
+        return $this->withMeta(['optionsDependOnMax' => $maxOptions]);
+    }
+
+    /**
+     * Sets the limit value for the field.
+     *
+     * @param string $limit
+     * @return \Outl1ne\MultiselectField\Multiselect
+     **/
+    public function limit($limit)
+    {
+        return $this->withMeta(['limit' => $limit]);
+    }
+
+    /**
+     * Sets group name for selects that need to have their values distinct.
+     *
+     * @param string $group
+     * @return \Outl1ne\MultiselectField\Multiselect
+     **/
+    public function distinct($group = "")
+    {
+        if (empty($group)) $group = $this->attribute;
+        return $this->withMeta(['distinct' => $group]);
     }
 
     public function resolveResponseValue($value, $templateModel)
@@ -246,110 +366,75 @@ class Multiselect extends Field
         return $this;
     }
 
-
-    /**
-     * Makes the field to manage a BelongsToMany relationship.
-     *
-     * @param string $resourceClass The Nova Resource class for the other model.
-     * @return \OptimistDigital\MultiselectField\Multiselect
-     **/
-    public function belongsToMany($resourceClass, $async = true)
-    {
-        $model = $resourceClass::$model;
-        $primaryKey = (new $model)->getKeyName();
-
-        $this->resolveUsing(function ($value) use ($async, $primaryKey, $resourceClass) {
-            $value = collect(array_values($value ?? []))->flatten(1)->pluck($primaryKey);
-            if ($async) $this->asyncResource($resourceClass);
-
-            $options = [];
-            $models = $async
-                ? $resourceClass::$model::whereIn($primaryKey, $value)->get()->filter()
-                : $resourceClass::$model::all();
-            $models->each(function ($model) use (&$options, $resourceClass) {
-                $options[$model[$model->getKeyName()]] = $model[$resourceClass::$title];
-            });
-            $this->options($options);
-
-            return $value;
-        });
-
-        $this->fillUsing(function ($request, $model, $requestAttribute, $attribute) {
-            $model::saved(function ($model) use ($attribute, $request) {
-                // Validate
-                if (!method_exists($model, $attribute)) {
-                    throw new RuntimeException("{$model}::{$attribute} must be a relation method.");
-                }
-
-                $relation = $model->{$attribute}();
-
-                if (!method_exists($relation, 'sync')) {
-                    throw new RuntimeException("{$model}::{$attribute} does not appear to model a BelongsToMany or MorphsToMany.");
-                }
-
-                // Sync
-                $relation->sync($request->get($attribute) ?? []);
-            });
-        });
-
-        return $this;
-    }
-
-    /**
-     * Makes the field to manage a BelongsTo relationship.
-     *
-     * @param string $resourceClass The Nova Resource class for the other model.
-     * @return \OptimistDigital\MultiselectField\Multiselect
-     **/
-    public function belongsTo($resourceClass, $async = true)
-    {
-        $this->singleSelect();
-
-        $model = $resourceClass::$model;
-        $primaryKey = (new $model)->getKeyName();
-
-        $this->resolveUsing(function ($value) use ($async, $primaryKey, $resourceClass) {
-            $value = $value->{$primaryKey} ?? null;
-            if ($async) $this->asyncResource($resourceClass);
-
-            $options = [];
-            if ($async && isset($value)) {
-                $model = $resourceClass::$model::find($value);
-                if (isset($model)) $options[$model[$primaryKey]] = $model[$resourceClass::$title];
-            } else {
-                $models = $resourceClass::$model::all();
-                $models->each(function ($model) use (&$options, $resourceClass) {
-                    $options[$model[$model->getKeyName()]] = $model[$resourceClass::$title];
-                });
-            }
-            $this->options($options);
-
-            return $value;
-        });
-
-        $this->fillUsing(function ($request, $model, $requestAttribute, $attribute) use ($resourceClass) {
-            $modelClass = get_class($model);
-
-            // Validate
-            if (!method_exists($model, $attribute)) {
-                throw new RuntimeException("{$modelClass}::{$attribute} must be a relation method.");
-            }
-
-            $relation = $model->{$attribute}();
-
-            if (!method_exists($relation, 'associate')) {
-                throw new RuntimeException("{$modelClass}::{$attribute} does not appear to model a BelongsTo relationship.");
-            }
-
-            // Sync
-            $relation->associate($resourceClass::$model::find($request->get($attribute)));
-        });
-
-        return $this;
-    }
-
     public function clearOnSelect($clearOnSelect = true)
     {
         return $this->withMeta(['clearOnSelect' => $clearOnSelect]);
+    }
+
+    /**
+     * Set the options from a collection of models.
+     *
+     * @param  \Illuminate\Support\Collection  $models
+     * @param  string  $resourceClass
+     * @return void
+     */
+    public function setOptionsFromModels(Collection $models, $resourceClass)
+    {
+        return $this->options(
+            $models
+                ->mapInto($resourceClass)
+                ->mapWithKeys(function ($associatedResource) {
+                    $keyName = $this->keyName ?? ($associatedResource ? $associatedResource->getKeyName() : null);
+                    if (!$keyName) return null;
+
+                    $resourceKey = $associatedResource->{$keyName};
+
+                    return [$resourceKey => $associatedResource->title()];
+                })
+                ->filter()
+        );
+    }
+
+    /**
+     * Sets delimiter for joining values on index
+     *
+     * @param  string $delimiter
+     * @return \Outl1ne\MultiselectField\Multiselect
+     */
+    public function indexDelimiter(string $delimiter)
+    {
+        return $this->withMeta(['indexDelimiter' => $delimiter]);
+    }
+
+    /**
+     * Sets amount of characters that can be shown on index at once
+     *
+     * @param  int $limit
+     * @return \Outl1ne\MultiselectField\Multiselect
+     */
+    public function indexCharDisplayLimit(int $limit)
+    {
+        return $this->withMeta(['indexCharDisplayLimit' => $limit]);
+    }
+
+    /**
+     * Sets amount of values that can be shown on index at once
+     *
+     * @param  int $limit
+     * @return \Outl1ne\MultiselectField\Multiselect
+     */
+    public function indexValueDisplayLimit(int $limit)
+    {
+        return $this->withMeta(['indexValueDisplayLimit' => $limit]);
+    }
+
+    /**
+     * Display the field as raw HTML using Vue.
+     *
+     * @return $this
+     */
+    public function asHtml()
+    {
+        return $this->withMeta(['asHtml' => true]);
     }
 }

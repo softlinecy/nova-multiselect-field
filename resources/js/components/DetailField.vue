@@ -1,11 +1,19 @@
 <template>
-  <panel-item :field="field">
-    <template slot="value">
-      <nova-multiselect-detail-field-value v-if="isMultiselect" :field="field" :values="values" />
+  <PanelItem :index="index" :field="field">
+    <template #value>
+      <Link
+        v-if="field.belongsToResourceName && field.viewable && field.value"
+        :href="$url(`/resources/${field.belongsToResourceName}/${field.value}`)"
+        class="link-default no-underline font-bold dim"
+      >
+        {{ field.belongsToDisplayValue }}
+      </Link>
+
+      <nova-multiselect-detail-field-value v-else-if="isMultiselect" :field="field" :values="values" />
 
       <div v-else>{{ (value && value.label) || '—' }}</div>
     </template>
-  </panel-item>
+  </PanelItem>
 </template>
 
 <script>
@@ -14,7 +22,7 @@ import HandlesFieldValue from '../mixins/HandlesFieldValue';
 export default {
   mixins: [HandlesFieldValue],
 
-  props: ['resource', 'resourceName', 'resourceId', 'field'],
+  props: ['index', 'resource', 'resourceName', 'resourceId', 'field'],
 
   computed: {
     values() {

@@ -1,23 +1,22 @@
 export default {
   data() {
     return {
-      options: [],
+      isInitialized: true,
     };
   },
 
   beforeMount() {
-    this.options = this.field.options || [];
+    this.options = this.currentField.options || [];
   },
 
   methods: {
     getInitialFieldValuesArray() {
       try {
-        if (!this.field.value) return void 0;
-        if (Array.isArray(this.field.value)) return this.field.value;
+        if (Array.isArray(this.currentField.value)) return this.currentField.value;
 
         // Attempt to parse the field value
-        if (typeof this.field.value === 'string') {
-          let value = this.field.value;
+        if (typeof this.currentField.value === 'string') {
+          let value = this.currentField.value;
           while (typeof value === 'string') value = JSON.parse(value);
           if (Array.isArray(value)) return value;
         }
@@ -29,10 +28,10 @@ export default {
     },
 
     getValueFromOptions(value) {
-      let options = this.field.options;
+      let options = this.currentField.options || [];
 
-      if (this.field.dependsOn) {
-        const valueGroups = Object.values(this.field.dependsOnOptions || {});
+      if (this.currentField.optionsDependOn) {
+        const valueGroups = Object.values(this.currentField.optionsDependOnOptions || {});
         options = [];
         valueGroups.forEach(values =>
           Object.keys(values).forEach(value => options.push({ value, label: values[value] }))
@@ -40,25 +39,37 @@ export default {
       }
 
       if (this.isOptionGroups) {
-        return this.field.options
+        return this.currentField.options
           .map(optGroup => optGroup.values.map(values => ({ ...values, group: optGroup.label })))
           .flat()
           .find(opt => String(opt.value) === String(value));
       }
 
-      return options.find(opt => String(opt.value) === String(value));
+      const option = options.find(opt => String(opt.value) === String(value));
+      if (option) return option;
+
+      // Taggable support
+      if (this.currentField.taggable) return { label: value, value };
     },
   },
   computed: {
+    currentField() {
+      return this.syncedField || this.field;
+    },
+
     isMultiselect() {
-      return !this.field.singleSelect;
+      return !this.currentField.singleSelect;
     },
 
     isOptionGroups() {
-      return !!this.field.options && !!this.field.options.find(opt => opt.values && Array.isArray(opt.values));
+      return (
+        !!this.currentField.options && !!this.currentField.options.find(opt => opt.values && Array.isArray(opt.values))
+      );
     },
 
     computedOptions() {
+      // Return empty array if the multiselect has not been opened yet.
+      if (!this.isInitialized) return [];
       let options = this.options || [];
 
       if (this.isOptionGroups) {
@@ -67,7 +78,7 @@ export default {
           return {
             ...option,
             values: option.values.map(opt => {
-              const isDuplicate = allLabels.filter(l => l === opt.label).length > 1;
+              const isDuplicate = this.mode === 'form' ? false : allLabels.filter(l => l === opt.label).length > 1;
               return { ...opt, label: isDuplicate ? `${opt.label} (${option.label})` : opt.label };
             }),
           };
