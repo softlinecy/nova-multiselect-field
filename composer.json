@@ -24,7 +24,7 @@
   "require": {
     "php": "^8.2.0",
     "laravel/nova": "^3.0",
-    "optimistdigital/nova-translations-loader": "^5.0.2"
+    "softlinecy/nova-translations-loader": "^3.1.4"
   },
   "autoload": {
     "psr-4": {
@@ -47,6 +47,11 @@
     {
       "type": "composer",
       "url": "https://nova.laravel.com"
+    },
+    {
+      "type": "vcs",
+      "url": "git@github.com:softlinecy/nova-translations-loader.git",
+      "packagist.org": false
     }
   ]
 }
