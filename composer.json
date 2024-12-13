@@ -1,5 +1,5 @@
 {
-  "name": "optimistdigital/nova-multiselect-field",
+  "name": "softlinecy/nova-multiselect-field",
   "version" : "2.4.3",
   "description": "A multiple select field for Laravel Nova.",
   "keywords": [
