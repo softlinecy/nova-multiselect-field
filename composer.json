@@ -47,11 +47,6 @@
     {
       "type": "composer",
       "url": "https://nova.laravel.com"
-    },
-    {
-      "type": "vcs",
-      "url": "git@github.com:softlinecy/nova-translations-loader.git",
-      "packagist.org": false
     }
   ]
 }
